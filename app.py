@@ -9,211 +9,200 @@ from ta.momentum import RSIIndicator
 import warnings
 warnings.filterwarnings("ignore")
 
-@st.cache_data
-def run_backtest(
-    symbols=None,
-    start="2015-01-01",
-    end=datetime.now().strftime("%Y-%m-%d"),
-    capital=100000,
-    rsi_threshold=40,
-    max_positions=5
-):
-    if symbols is None:
-        symbols = "RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS SBIN.NS BHARTIARTL.NS ITC.NS HINDUNILVR.NS LT.NS".split()
-
-    # Download data
+# ==============================
+# DATA FETCH (CACHED)
+# ==============================
+@st.cache_data(ttl=3600)  # Cache 1 hour
+def fetch_data(symbols, start="2015-01-01", end=None):
+    if end is None:
+        end = datetime.now().strftime("%Y-%m-%d")
     data = yf.download(symbols, start=start, end=end, progress=False)
     if data.empty:
-        return None, None, None, None, None, None
-    close = data['Close']
-    open_ = data['Open']
+        st.error("No data downloaded. Check symbols or date range.")
+        return None, None
+    close = data['Close'].ffill()
+    open_ = data['Open'].ffill()
+    return close, open_
 
-    # Indicators
+# ==============================
+# INDICATORS (CACHED)
+# ==============================
+@st.cache_data(ttl=3600)
+def compute_indicators(close):
     sma20 = close.rolling(20).mean()
-    rsi = pd.DataFrame(index=close.index, columns=close.columns)
-    for col in close.columns:
-        rsi[col] = RSIIndicator(close[col], window=14).rsi()
+    rsi = close.apply(lambda col: RSIIndicator(col, window=14).rsi())
     dist = (close - sma20) / sma20
+    return sma20, rsi, dist
 
-    # Simplified signals (vectorbt-friendly; loop for logic)
+# ==============================
+# BACKTEST (NOT CACHED — vectorbt not pickleable)
+# ==============================
+def run_backtest_live(close, open_, capital, rsi_threshold, max_positions):
+    sma20, rsi, dist = compute_indicators(close)
+
     entries = pd.DataFrame(False, index=close.index, columns=close.columns, dtype=bool)
     exits = pd.DataFrame(False, index=close.index, columns=close.columns, dtype=bool)
 
-    # Basic portfolio simulation (equal size, no complex avg down for speed; add if needed)
-    size = capital * 0.20 / max_positions
-
-    # Scan loop (simplified)
-    for i in range(35, len(close)):
-        date = close.index[i]
-        curr_close = close.iloc[i]
-        curr_open = open_.iloc[i]
-        curr_sma = sma20.iloc[i]
-        curr_rsi = rsi.iloc[i]
-        curr_dist = dist.iloc[i]
-
-        # Scan: Top 5 below SMA with RSI < threshold
-        valid = (curr_rsi < rsi_threshold) & (curr_dist < 0)
-        if valid.any():
-            candidates = curr_dist[valid].nsmallest(max_positions)
-            for sym in candidates.index:
-                entries.iloc[i, close.columns.get_loc(sym)] = True
-
-        # Simple exit: If signal reverses (above SMA next day; placeholder for +8%)
-        for sym in close.columns:
-            if entries[sym].iloc[:i].any() and not exits[sym].iloc[:i].any():  # Has open position
-                if curr_close[sym] > curr_sma[sym] * 1.08:  # +8% above SMA proxy
-                    exits.iloc[i, close.columns.get_loc(sym)] = True
+    size_per_trade = capital * 0.20 / max_positions
 
     try:
         import vectorbt as vbt
-        pf = vbt.Portfolio.from_signals(
-            close, entries=entries, exits=exits,
-            size=size, size_type='value', init_cash=capital,
-            fees=0.001, freq='1D'
-        )
     except ImportError:
-        st.error("vectorbt not installed. Install via requirements.txt.")
-        return None, None, None, None, None, None
+        st.error("vectorbt not installed. Add to requirements.txt.")
+        return None
 
-    return pf, entries, close, sma20, rsi, dist
+    # Scan loop
+    for i in range(35, len(close)):
+        date = close.index[i]
+        c = close.iloc[i]
+        o = open_.iloc[i]
+        s = sma20.iloc[i]
+        r = rsi.iloc[i]
+        d = dist.iloc[i]
 
+        # ENTRY: Top N farthest below SMA with RSI < threshold
+        valid = (r < rsi_threshold) & (d < 0)
+        if valid.any():
+            candidates = d[valid].nsmallest(max_positions)
+            for sym in candidates.index:
+                if not entries[sym].iloc[:i].any():  # No open position
+                    entries.iloc[i, close.columns.get_loc(sym)] = True
+
+        # EXIT: +8% above entry price (simplified)
+        for sym in close.columns:
+            pos_entries = entries[sym].iloc[:i+1]
+            if pos_entries.any():
+                entry_idx = pos_entries[pos_entries].index[-1]
+                entry_price = o.loc[entry_idx, sym] if entry_idx in o.index else c[sym]
+                if c[sym] >= entry_price * 1.08:
+                    exits.iloc[i, close.columns.get_loc(sym)] = True
+
+    # Build portfolio
+    pf = vbt.Portfolio.from_signals(
+        close=close,
+        entries=entries,
+        exits=exits,
+        size=size_per_trade,
+        size_type='value',
+        init_cash=capital,
+        fees=0.001,
+        freq='1D'
+    )
+    return pf, entries
+
+# ==============================
+# STREAMLIT UI
+# ==============================
 st.set_page_config(page_title="Nifty Shop Swing + RSI", layout="wide")
-st.title("🛒 Nifty Shop Swing Strategy + RSI(14) Filter")
-st.markdown("**Mean-reversion swing strategy: Top 5 oversold (RSI<40) below 20-SMA → +8% TP, average down on 3% dips**")
+st.title("Nifty Shop Swing Strategy + RSI(14) Filter")
+st.markdown("**Top 5 stocks farthest below 20-SMA with RSI(14) < 40 → Buy, exit at +8%, average down on 3% dips**")
 
-# Sidebar
-st.sidebar.header("Settings")
-capital = st.sidebar.number_input("Starting Capital (₹)", 50000, 500000, 100000, 10000)
+# --- Sidebar ---
+st.sidebar.header("Backtest Settings")
+capital = st.sidebar.number_input("Capital (₹)", 50000, 1000000, 100000, 10000)
 rsi_filter = st.sidebar.slider("RSI(14) Threshold", 20, 50, 40)
 max_stocks = st.sidebar.number_input("Max Stocks per Day", 1, 10, 5)
 
-if st.sidebar.button("Run Full Backtest"):
-    with st.spinner("Running backtest (2015–today)..."):
-        result = run_backtest(capital=capital, rsi_threshold=rsi_filter, max_positions=max_stocks)
-        if result[0] is not None:
-            st.session_state.update(dict(zip(['pf', 'entries', 'close', 'sma20', 'rsi', 'dist'], result)))
-            st.success("Backtest complete!")
-        else:
-            st.error("Backtest failed—check logs.")
+symbols = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+           "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "HINDUNILVR.NS", "LT.NS"]
 
-# Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Live Scan", "Backtest Summary", "Equity Curve", "Trade Log", "Download"])
-
-# === TAB 1: LIVE SCAN ===
-with tab1:
-    st.header("🔍 Today's Entry Signals")
-    today = datetime.now().strftime("%Y-%m-%d")
-    symbols = "RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS SBIN.NS BHARTIARTL.NS ITC.NS HINDUNILVR.NS LT.NS".split()
-    if datetime.now().weekday() >= 5:
-        st.warning("Market closed (Weekend)")
-    else:
-        with st.spinner("Scanning market..."):
-            @st.cache_data(ttl=300)  # Cache 5 min
-            def get_live_data():
-                data = yf.download(symbols, period="2mo", progress=False)['Close']
-                sma20 = data.rolling(20).mean().iloc[-1]
-                rsi_val = pd.DataFrame(index=data.index, columns=data.columns)
-                for col in data.columns:
-                    rsi_val[col] = RSIIndicator(data[col], window=14).rsi()
-                rsi_val = rsi_val.iloc[-1]
-                close_today = data.iloc[-1]
-                dist = (close_today - sma20) / sma20
-                return close_today, sma20, rsi_val, dist
-
-            close_today, sma20, rsi_val, dist = get_live_data()
-            valid = (rsi_val < rsi_filter) & (dist < 0)
-            candidates = dist[valid].nsmallest(max_stocks)
-
-            if len(candidates) > 0:
-                df = pd.DataFrame({
-                    "Stock": candidates.index,
-                    "Price": close_today[candidates.index].round(2),
-                    "SMA20": sma20[candidates.index].round(2),
-                    "Dist %": (dist[candidates.index] * 100).round(2),
-                    "RSI(14)": rsi_val[candidates.index].round(1)
-                }).sort_values("Dist %")
-                st.success(f"**{len(df)} SIGNAL(S) TODAY**")
-                st.dataframe(df.style.highlight_min(subset=["Dist %"], color='lightgreen'), use_container_width=True)
+if st.sidebar.button("Run Backtest (2015–Today)"):
+    with st.spinner("Downloading data & running backtest..."):
+        close, open_ = fetch_data(symbols)
+        if close is not None:
+            pf, entries = run_backtest_live(close, open_, capital, rsi_filter, max_stocks)
+            if pf is not None:
+                st.session_state.pf = pf
+                st.session_state.entries = entries
+                st.session_state.close = close
+                st.success("Backtest completed!")
             else:
-                st.info("No signals today. Waiting for pullback...")
+                st.error("Backtest failed.")
+        else:
+            st.error("Data fetch failed.")
 
-# === TAB 2: BACKTEST SUMMARY ===
+# --- Tabs ---
+tab1, tab2, tab3, tab4 = st.tabs(["Live Scan", "Backtest", "Equity", "Trades"])
+
+# === LIVE SCAN ===
+with tab1:
+    st.header("Today's Signals")
+    if datetime.now().weekday() >= 5:
+        st.warning("Market Closed (Weekend)")
+    else:
+        with st.spinner("Scanning live market..."):
+            close_today, _ = fetch_data(symbols, start=(datetime.now() - pd.Timedelta(60, 'd')).strftime("%Y-%m-%d"))
+            if close_today is not None:
+                sma20, rsi_val, dist = compute_indicators(close_today)
+                latest = close_today.iloc[-1]
+                sma_latest = sma20.iloc[-1]
+                rsi_latest = rsi_val.iloc[-1]
+                dist_latest = dist.iloc[-1]
+
+                valid = (rsi_latest < rsi_filter) & (dist_latest < 0)
+                candidates = dist_latest[valid].nsmallest(max_stocks)
+
+                if len(candidates) > 0:
+                    df = pd.DataFrame({
+                        "Stock": candidates.index,
+                        "Price": latest[candidates.index].round(2),
+                        "SMA20": sma_latest[candidates.index].round(2),
+                        "Dist %": (dist_latest[candidates.index] * 100).round(2),
+                        "RSI": rsi_latest[candidates.index].round(1)
+                    }).sort_values("Dist %")
+                    st.success(f"**{len(df)} BUY SIGNAL(S) TODAY**")
+                    st.dataframe(df.style.format({"Price": "₹{:.2f}", "SMA20": "₹{:.2f}"}), use_container_width=True)
+                else:
+                    st.info("No signals today.")
+            else:
+                st.error("Live data failed.")
+
+# === BACKTEST SUMMARY ===
 with tab2:
-    st.header("📊 Backtest Performance")
+    st.header("Backtest Results")
     if 'pf' in st.session_state:
         pf = st.session_state.pf
         stats = pf.stats()
         total_ret = pf.total_return()
-        days = len(pf.wrapper.index)
-        cagr = (1 + total_ret) ** (252 / days) - 1 if days > 0 else 0
-        col1, col2, col3, col4 = st.columns(4)
+        years = len(pf.wrapper.index) / 252
+        cagr = (1 + total_ret) ** (1/years) - 1 if years > 0 else 0
+
+        col1, col2 = st.columns(2)
         col1.metric("Total Return", f"{total_ret:+.1%}")
         col2.metric("CAGR", f"{cagr:+.1%}")
-        col3.metric("Win Rate", f"{pf.trades.win_rate():.1%}")
-        col4.metric("Total Trades", int(pf.trades.count()))
         col1, col2, col3 = st.columns(3)
-        col1.metric("Avg Trade", f"{pf.trades.returns.mean():+.1%}")
-        col2.metric("Max DD", f"{stats['Max Drawdown [%]']:.1f}%")
-        col3.metric("Sharpe", f"{stats['Sharpe Ratio']:.2f}")
+        col1.metric("Win Rate", f"{pf.trades.win_rate():.1%}")
+        col2.metric("Trades", int(pf.trades.count()))
+        col3.metric("Sharpe", f"{stats.get('Sharpe Ratio', 0):.2f}")
     else:
-        st.info("Click 'Run Full Backtest' in sidebar")
+        st.info("Run backtest first.")
 
-# === TAB 3: EQUITY CURVE ===
+# === EQUITY CURVE ===
 with tab3:
-    st.header("📈 Equity Curve")
+    st.header("Equity Curve")
     if 'pf' in st.session_state:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=st.session_state.pf.wrapper.index, y=st.session_state.pf.value(), mode='lines', name='Portfolio Value'))
-        fig.update_layout(title="Equity Curve", xaxis_title="Date", yaxis_title="Value (₹)")
+        fig.add_trace(go.Scatter(x=st.session_state.pf.wrapper.index, y=st.session_state.pf.value(), mode='lines'))
+        fig.update_layout(title="Portfolio Value Over Time", xaxis_title="Date", yaxis_title="₹ Value")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Run backtest first")
+        st.info("Run backtest first.")
 
-# === TAB 4: TRADE LOG ===
+# === TRADES ===
 with tab4:
-    st.header("📋 Trade History")
+    st.header("Trade Log")
     if 'pf' in st.session_state:
         trades = st.session_state.pf.trades.records_readable
         if not trades.empty:
-            trades['Return %'] = trades['Return'] * 100
-            st.dataframe(trades[['Symbol', 'Entry Timestamp', 'Exit Timestamp', 'Return %', 'Size', 'Fees']].round(2), use_container_width=True)
+            trades['Return %'] = (trades['Return'] * 100).round(2)
+            st.dataframe(trades[['Symbol', 'Entry Timestamp', 'Exit Timestamp', 'Return %', 'Duration']], use_container_width=True)
         else:
-            st.info("No trades in this backtest.")
+            st.info("No trades.")
     else:
-        st.info("Run backtest first")
+        st.info("Run backtest first.")
 
-# === TAB 5: DOWNLOAD ===
-with tab5:
-    st.header("💾 Export Data")
-    if 'pf' in st.session_state:
-        # Signals CSV
-        signals = st.session_state.entries[st.session_state.entries.any(axis=1)]
-        csv = signals.to_csv().encode('utf-8')
-        st.download_button("Download Entry Signals (CSV)", csv, "nifty_shop_signals.csv", "text/csv")
-
-        # Report TXT
-        total_ret = st.session_state.pf.total_return()
-        days = len(st.session_state.pf.wrapper.index)
-        cagr = (1 + total_ret) ** (252 / days) - 1 if days > 0 else 0
-        report = f"""Nifty Shop Swing + RSI(14) Backtest Report
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-Capital: ₹{capital:,}
-RSI Filter: < {rsi_filter}
-Max Stocks: {max_stocks}
-
-Total Return: {total_ret:+.1%}
-CAGR: {cagr:+.1%}
-Win Rate: {st.session_state.pf.trades.win_rate():.1%}
-Trades: {int(st.session_state.pf.trades.count())}
-        """
-        st.download_button("Download Report (TXT)", report, "backtest_report.txt", "text/plain")
-    else:
-        st.info("Run backtest to download")
-
-# Footer
+# --- Footer ---
 st.sidebar.markdown("---")
-st.sidebar.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-if st.sidebar.button("Refresh Data"):
+if st.sidebar.button("Clear Cache & Rerun"):
     st.cache_data.clear()
     st.rerun()
