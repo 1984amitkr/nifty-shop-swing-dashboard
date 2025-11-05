@@ -164,22 +164,34 @@ with tab2:
         pf = st.session_state.pf
         stats = pf.stats()
 
-        # Ensure Python floats
-        total_ret = float(pf.total_return())
-        years = len(pf.wrapper.index) / 252
-        cagr = float((1 + total_ret) ** (1/years) - 1) if years > 0 else 0.0
+        # Safely extract total return
+        total_ret_raw = pf.total_return()
+        total_ret = total_ret_raw.iloc[0] if isinstance(total_ret_raw, pd.Series) else float(total_ret_raw)
 
+        # CAGR
+        trading_days = len(pf.wrapper.index)
+        years = trading_days / 252.0
+        cagr = (1 + total_ret) ** (1/years) - 1 if years > 0 else 0
+
+        # Win rate
+        win_rate_raw = pf.trades.win_rate()
+        win_rate = win_rate_raw.iloc[0] if isinstance(win_rate_raw, pd.Series) else float(win_rate_raw)
+
+        # Sharpe
+        sharpe = float(stats.get('Sharpe Ratio', 0))
+
+        # Display
         col1, col2 = st.columns(2)
         col1.metric("Total Return", f"{total_ret:+.1%}")
         col2.metric("CAGR", f"{cagr:+.1%}")
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Win Rate", f"{float(pf.trades.win_rate()):.1%}")
+        col1.metric("Win Rate", f"{win_rate:.1%}")
         col2.metric("Trades", int(pf.trades.count()))
-        col3.metric("Sharpe", f"{float(stats.get('Sharpe Ratio', 0)):.2f}")
+        col3.metric("Sharpe", f"{sharpe:.2f}")
     else:
         st.info("Click 'Run Backtest' in sidebar")
-
+        
 # === EQUITY CURVE ===
 with tab3:
     st.header("Equity Curve")
