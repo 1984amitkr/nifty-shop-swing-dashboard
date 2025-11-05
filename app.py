@@ -163,19 +163,22 @@ with tab2:
     if 'pf' in st.session_state:
         pf = st.session_state.pf
         stats = pf.stats()
-        total_ret = pf.total_return()
+
+        # Ensure Python floats
+        total_ret = float(pf.total_return())
         years = len(pf.wrapper.index) / 252
-        cagr = (1 + total_ret) ** (1/years) - 1 if years > 0 else 0
+        cagr = float((1 + total_ret) ** (1/years) - 1) if years > 0 else 0.0
 
         col1, col2 = st.columns(2)
         col1.metric("Total Return", f"{total_ret:+.1%}")
         col2.metric("CAGR", f"{cagr:+.1%}")
+
         col1, col2, col3 = st.columns(3)
-        col1.metric("Win Rate", f"{pf.trades.win_rate():.1%}")
+        col1.metric("Win Rate", f"{float(pf.trades.win_rate()):.1%}")
         col2.metric("Trades", int(pf.trades.count()))
-        col3.metric("Sharpe", f"{stats.get('Sharpe Ratio', 0):.2f}")
+        col3.metric("Sharpe", f"{float(stats.get('Sharpe Ratio', 0)):.2f}")
     else:
-        st.info("Run backtest first.")
+        st.info("Click 'Run Backtest' in sidebar")
 
 # === EQUITY CURVE ===
 with tab3:
